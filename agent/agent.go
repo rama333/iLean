@@ -10,7 +10,6 @@ import (
 	"iLean/config"
 	"iLean/entity"
 	"io"
-	"log"
 	"sync"
 	"time"
 )
@@ -24,89 +23,144 @@ type Agent struct {
 	connect *websocket.Conn
 	buffer  []byte
 	port    io.ReadWriteCloser
-	mutex sync.Mutex
-	Config config.Config
+	mutex   sync.Mutex
+	Config  config.Config
+	err     chan error
 }
 
 func NewAgent(conf *config.Config) (*Agent, error) {
 
-	connect, err := connectToSocket("ws://45.141.79.96:63240/ws", conf.Serial)
+	agent := new(Agent)
+	agent.Config = *conf
+	agent.mutex = sync.Mutex{}
+	agent.err = make(chan error)
 
-	if err != nil {
-		logrus.Fatal(err)
-	}
+	logrus.Info("connect to socket")
+	agent.connectToSocket()
 
-	port, err := connectToDevice()
+	logrus.Info("connect to device")
+	agent.connectToDevice()
 
-	if err != nil {
-		return nil, err
-	}
+	go agent.Connector()
 
-	return &Agent{port: port, connect: connect, mutex: sync.Mutex{}, Config: *conf}, nil
+	return agent, nil
 
 }
 
-func connectToSocket(URL string, serial int) (*websocket.Conn, error) {
+func (a *Agent) Connector() {
+	for {
+		<-a.err
 
-	connect, _, err := websocket.DefaultDialer.Dial(URL, nil)
+		logrus.Info("lost connection")
 
-	type Greet struct {
-		SerialNumber int    `json:"serial_number"`
-		TypeClient   string `json:"type_client"`
+		logrus.Info("reconnect")
+
+		a.connectToSocket()
+
+		a.connectToDevice()
+
+		a.ProcessingStream()
+
 	}
-
-	greet := Greet{SerialNumber: serial, TypeClient: "controller"}
-
-	byteGreet, err := json.Marshal(greet)
-
-	if err != nil {
-		return nil, err
-	}
-
-	err = connect.WriteMessage(websocket.TextMessage, byteGreet)
-
-	if err != nil {
-		return nil, err
-	}
-
-	_, mes, err := connect.ReadMessage()
-
-	if err != nil {
-		return nil, err
-	}
-
-	logrus.Info("oki", string(mes))
-
-	if string(mes) != "ok" {
-		return nil, err
-	}
-
-	return connect, nil
 }
 
-func connectToDevice() (io.ReadWriteCloser, error) {
+func (a *Agent) connectToSocket() {
 
-	// Set up options.
-	options := serial.OpenOptions{
-		PortName:        "/dev/ttyAMA0",
-		DataBits:        8,
-		BaudRate:        115200,
-		StopBits:        1,
-		MinimumReadSize: 2,
+	for {
+
+		connect, _, err := websocket.DefaultDialer.Dial("ws://45.141.79.96:63240/ws", nil)
+
+		if err != nil {
+			logrus.WithError(err).Error("failed to connect to server")
+			time.Sleep(time.Second * 4)
+			logrus.Info("reconnect")
+			continue
+		}
+
+
+
+		type Greet struct {
+			SerialNumber int    `json:"serial_number"`
+			TypeClient   string `json:"type_client"`
+		}
+
+		greet := Greet{SerialNumber: a.Config.Serial, TypeClient: "controller"}
+
+		byteGreet, err := json.Marshal(greet)
+
+		if err != nil {
+			logrus.WithError(err).Error("failed marshal json")
+			time.Sleep(time.Second * 4)
+			logrus.Info("reconnect")
+			continue
+		}
+
+		err = connect.WriteMessage(websocket.TextMessage, byteGreet)
+
+		if err != nil {
+			logrus.WithError(err).Error("failed marshal json")
+			time.Sleep(time.Second * 4)
+			logrus.Info("reconnect")
+			continue
+		}
+
+		_, mes, err := connect.ReadMessage()
+
+		if err != nil {
+			logrus.WithError(err).Error("failed read messages from server")
+			time.Sleep(time.Second * 4)
+			logrus.Info("reconnect")
+			continue
+		}
+
+		if string(mes) == "ok" {
+			logrus.Info("success connect to server")
+			a.connect = connect
+			return
+		} else {
+			logrus.WithError(err).Error("failed messages from server")
+			time.Sleep(time.Second * 4)
+			logrus.Info("reconnect")
+			continue
+		}
+
 	}
+}
 
-	// Open the port.
-	port, err := serial.Open(options)
+func (a *Agent) connectToDevice() {
 
-	if err != nil {
-		return nil, err
+	for {
+
+		options := serial.OpenOptions{
+			PortName:        "/dev/ttyAMA0",
+			DataBits:        8,
+			BaudRate:        115200,
+			StopBits:        1,
+			MinimumReadSize: 2,
+		}
+
+		// Open the port.
+		port, err := serial.Open(options)
+
+		if err != nil {
+			logrus.Error("failed connect to device")
+			time.Sleep(time.Second * 4)
+			logrus.Info("reconnect")
+			continue
+
+		} else {
+			logrus.Info("success connect to device")
+			a.port = port
+			return
+		}
+
 	}
-
-	return port, nil
 
 }
 
 func (a *Agent) ProcessingStream() {
+
+	logrus.Info("start processing data")
 
 	go func(agent *Agent) {
 
@@ -118,6 +172,8 @@ func (a *Agent) ProcessingStream() {
 
 			if err != nil {
 				logrus.Error(err)
+				a.err <- err
+				return
 			}
 
 			buf := bytes.NewBuffer([]byte{})
@@ -151,7 +207,6 @@ func (a *Agent) ProcessingStream() {
 
 			if err == nil && commandTemperature.Temperature > 0 {
 
-
 				var zone4Byte int32 = int32(commandTemperature.Zone)
 
 				if err := binary.Write(buf, binary.LittleEndian, zone4Byte); err != nil {
@@ -171,8 +226,6 @@ func (a *Agent) ProcessingStream() {
 				}
 
 			}
-
-
 
 			err = json.Unmarshal(mes, &commandTemperatureBySensor)
 
@@ -210,7 +263,7 @@ func (a *Agent) ProcessingStream() {
 			t := time.Now()
 			_, err = a.port.Write(buf.Bytes())
 			if err != nil {
-				log.Fatalf("port.Write: %v", err)
+				logrus.WithError(err).Error("failed write to device")
 			}
 
 			logrus.Info(time.Now().Sub(t).Seconds(), " sec")
@@ -222,29 +275,29 @@ func (a *Agent) ProcessingStream() {
 		}
 	}(a)
 
-
-	go func(agent *Agent) {
-
-		for {
-			agent.connect.SetWriteDeadline(time.Now().Add(60 * time.Second))
-
-
-			agent.mutex.Lock()
-			if err := agent.connect.WriteMessage(websocket.PingMessage, nil); err != nil {
-				logrus.Error(err)
-			}
-			agent.mutex.Unlock()
-
-			agent.connect.SetPingHandler(func(string) error {
-				logrus.Info("ping")
-				agent.connect.SetReadDeadline(time.Now().Add(60 * time.Second))
-				return nil
-			})
-
-			time.Sleep(20 * time.Second)
-		}
-
-	}(a)
+	//go func(agent *Agent) {
+	//
+	//	for {
+	//		agent.connect.SetWriteDeadline(time.Now().Add(60 * time.Second))
+	//
+	//		agent.mutex.Lock()
+	//		if err := agent.connect.WriteMessage(websocket.PingMessage, nil); err != nil {
+	//			logrus.Error(err)
+	//			a.err <- err
+	//			return
+	//		}
+	//		agent.mutex.Unlock()
+	//
+	//		agent.connect.SetPingHandler(func(string) error {
+	//			logrus.Info("ping")
+	//			agent.connect.SetReadDeadline(time.Now().Add(60 * time.Second))
+	//			return nil
+	//		})
+	//
+	//		time.Sleep(20 * time.Second)
+	//	}
+	//
+	//}(a)
 
 	preamOne := false
 	preamTwo := false
@@ -278,10 +331,9 @@ func (a *Agent) ProcessingStream() {
 				if buf[0] == preamTwoByte || preamTwo {
 					preamTwo = true
 
-					if buf[0] == preamTwoByte && !preamThree  {
+					if buf[0] == preamTwoByte && !preamThree {
 						continue
 					}
-
 
 					if buf[0] == preamOneByte || preamThree {
 						preamThree = true
@@ -289,7 +341,6 @@ func (a *Agent) ProcessingStream() {
 						if buf[0] == preamOneByte {
 							continue
 						}
-
 
 						if buf[0] == preamTwoByte || preamFour {
 							preamFour = true
@@ -364,7 +415,6 @@ func (a *Agent) ProcessingStream() {
 					logrus.Info("datebase", dataAddresCommand)
 				}
 
-
 				if dataAddresCommand.Command == 1 {
 
 					logBuff := make([]byte, 0)
@@ -393,7 +443,6 @@ func (a *Agent) ProcessingStream() {
 							if err != nil {
 								logrus.Error("binary.Read failed:", err)
 							}
-
 
 							for _, item := range data {
 								logBuff = append(logBuff, item)
@@ -469,7 +518,9 @@ func (a *Agent) ProcessingStream() {
 					a.mutex.Unlock()
 
 					if err != nil {
-						logrus.Error(err)
+						logrus.WithError(err).Error("connection to lost")
+						a.err <- err
+						return
 					}
 
 				}
@@ -594,7 +645,9 @@ func (a *Agent) ProcessingStream() {
 					a.mutex.Unlock()
 
 					if err != nil {
-						logrus.Error(err)
+						logrus.WithError(err).Error("connection to lost")
+						a.err <- err
+						return
 					}
 
 					//buf := bytes.NewReader(data[5:21])

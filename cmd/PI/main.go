@@ -16,12 +16,15 @@ func main() {
 }
 
 func run() error {
+
+	logrus.Info("run application PI")
+
 	var st time.Time
 	defer func() {
 		logrus.WithField("shutdown_time", time.Now().Sub(st)).Info("stopped")
 	}()
 
-	config, err := config.LoadConfig("./../../config/pi.conf")
+	config, err := config.LoadConfig("/opt/config/pi.conf")
 
 	if err != nil {
 		logrus.Fatal("failed load config", err)
